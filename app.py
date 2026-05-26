@@ -2,6 +2,7 @@
 Agri-Vision Flask Application
 Unified inference for disease classification (ResNet50) and growth stage prediction (YOLOv8)
 Thread-safe execution for production environments with Celery Async Support.
+Optimized via a Two-Pointer Ambiguity Filter for overlapping disease classes.
 """
 
 from __future__ import annotations
@@ -33,6 +34,7 @@ from flask import (
     request,
     stream_with_context,
     url_for,
+    Request,
 )
 from flask_cors import CORS
 from PIL import Image
@@ -45,6 +47,7 @@ from services.weather_service import (
     geocode_city,
     get_weather,
 )
+from services.yield_service import estimate_yield
 
 load_dotenv()
 
@@ -52,6 +55,12 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
+
+class CustomRequest(Request):
+    max_form_memory_size = 25 * 1024 * 1024  # Support larger base64-encoded forms
+
+app.request_class = CustomRequest
+
 swagger = Swagger(app)
 CORS(app)
 
@@ -63,6 +72,7 @@ app.jinja_env.cache = {}
 secret_key = os.getenv("SECRET_KEY") or "dev_secret_123"
 app.secret_key = secret_key
 app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024
+app.config["MAX_FORM_MEMORY_SIZE"] = 25 * 1024 * 1024
 
 LANG = {
     "en": {"welcome": "Welcome to Agri Vision"},
@@ -156,7 +166,7 @@ AMBIGUITY_MARGIN = 0.08
 
 
 # -------------------------------------------------------------------
-# THREAD-SAFE MODEL MANAGER (My advanced PR implementation)
+# THREAD-SAFE MODEL MANAGER
 # -------------------------------------------------------------------
 class ModelManager:
     _instance = None
@@ -235,15 +245,36 @@ class ModelManager:
             },
         }
 
+
 model_manager = ModelManager()
 
 resnet_model = None
 yolo_model = None
 
+
 def load_models():
     """Wrapper for backward compatibility"""
-    global resnet_model, yolo_model
-    resnet_model, yolo_model = model_manager.load_models()
+    global resnet_model, yolo_model, grad_cam_instance
+
+    if resnet_model is None:
+        try:
+            resnet_model, yolo_model = model_manager.load_models()
+
+            # Keep compatibility with newer PyTorch versions
+            if resnet_model is None:
+                resnet_model = torch.load(
+                    "models/cotton_crop_disease_classification/full_resnet50_model.pth",
+                    map_location=torch.device("cpu"),
+                    weights_only=False,
+                )
+
+            resnet_model.eval()
+            logger.info("ResNet50 model loaded successfully")
+
+        except Exception as e:
+            logger.error(f"Error loading models: {e}")
+            raise
+
     return resnet_model, yolo_model
 
 def ensure_models_loaded() -> None:
@@ -260,6 +291,7 @@ def _ensure_rgb(image: np.ndarray) -> np.ndarray:
         raise ValueError("Expected an RGB image with 3 channels")
     return image
 
+
 def resize_image(image: np.ndarray, max_dim: int = MAX_INFERENCE_DIMENSION) -> np.ndarray:
     height, width = image.shape[:2]
     if max(height, width) <= max_dim:
@@ -268,26 +300,11 @@ def resize_image(image: np.ndarray, max_dim: int = MAX_INFERENCE_DIMENSION) -> n
     new_size = (max(1, int(width * scale)), max(1, int(height * scale)))
     return cv2.resize(image, new_size, interpolation=cv2.INTER_AREA)
 
+
 def calculate_disease_severity(health_score: float) -> float:
     return max(0.0, 100.0 - float(health_score))
 
-def predict_yield(health_score: float, growth_stage: str, area_acres: float = 1.0) -> Dict[str, float]:
-    base_yield = 700.0
-    health_factor = float(health_score) / 100.0
-    stage_factors = {
-        "Cotton Blossom": 0.8,
-        "Cotton Bud": 0.9,
-        "Early Boll": 1.0,
-        "Matured Cotton Boll": 1.1,
-        "Split Cotton Boll": 1.0,
-    }
-    g_factor = stage_factors.get(growth_stage, 0.9)
-    estimated_yield = base_yield * health_factor * g_factor * float(area_acres)
-    confidence = min(95.0, 50.0 + (float(health_score) * 0.4))
-    return {
-        "estimated_yield_kg_per_acre": round(estimated_yield, 2),
-        "confidence_percentage": round(confidence, 2),
-    }
+
 
 def generate_mock_heatmap(image_rgb: np.ndarray) -> np.ndarray:
     h, w, _ = image_rgb.shape
@@ -300,22 +317,27 @@ def generate_mock_heatmap(image_rgb: np.ndarray) -> np.ndarray:
     heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
     return heatmap
 
-def apply_heatmap_on_image(image_rgb: np.ndarray, heatmap: np.ndarray, alpha: float = 0.6, beta: float = 0.4) -> np.ndarray:
+
+def generate_pure_heatmap(image_rgb: np.ndarray, heatmap: np.ndarray) -> np.ndarray:
     h, w, _ = image_rgb.shape
     heatmap_resized = cv2.resize(heatmap, (w, h))
     heatmap_255 = np.uint8(255 * heatmap_resized)
     heatmap_color = cv2.applyColorMap(heatmap_255, cv2.COLORMAP_JET)
-    heatmap_color_rgb = cv2.cvtColor(heatmap_color, cv2.COLOR_BGR2RGB)
+    return cv2.cvtColor(heatmap_color, cv2.COLOR_BGR2RGB)
+
+
+def apply_heatmap_on_image(image_rgb: np.ndarray, heatmap: np.ndarray, alpha: float = 0.6, beta: float = 0.4) -> np.ndarray:
+    heatmap_color_rgb = generate_pure_heatmap(image_rgb, heatmap)
     return cv2.addWeighted(image_rgb, alpha, heatmap_color_rgb, beta, 0)
 
 
 class GradCAM:
-    """Grad-CAM helper with explicit hook handle cleanup."""
     def __init__(self, model: torch.nn.Module, target_layer: torch.nn.Module):
         self.model = model
         self.target_layer = target_layer
         self.gradients = None
         self.activations = None
+        self.heatmap_np = None
         self.forward_handle = self.target_layer.register_forward_hook(self._save_activation)
         self.backward_handle = self.target_layer.register_full_backward_hook(self._save_gradient)
         logger.info("Grad-CAM hooks registered on layer: %s", target_layer.__class__.__name__)
@@ -350,8 +372,12 @@ class GradCAM:
         self.model.zero_grad(set_to_none=True)
         self.activations = None
         self.gradients = None
+        self.heatmap_np = None
 
         try:
+            device = next(self.model.parameters()).device
+            input_tensor = input_tensor.to(device)
+
             with torch.enable_grad():
                 output = self.model(input_tensor)
                 if target_class_idx is None:
@@ -376,6 +402,7 @@ class GradCAM:
                     heatmap = heatmap / max_val
 
                 heatmap_np = heatmap.detach().cpu().numpy()
+                self.heatmap_np = heatmap_np
                 return apply_heatmap_on_image(original_image_rgb, heatmap_np)
 
         except Exception as exc:
@@ -398,6 +425,7 @@ def preprocess_image_for_resnet(image: np.ndarray, target_size: Tuple[int, int] 
     tensor = transform(image).unsqueeze(0)
     return tensor
 
+
 def infer_disease(image: np.ndarray) -> Dict[str, Any]:
     global resnet_model
     if resnet_model is None:
@@ -415,12 +443,21 @@ def infer_disease(image: np.ndarray) -> Dict[str, Any]:
         probs_np = probs_np / probs_np.sum(axis=1, keepdims=True)
 
     probabilities = probs_np[0]
-    sorted_indices = np.argsort(probabilities)[::-1]
-    top1_idx = int(sorted_indices[0])
-    top2_idx = int(sorted_indices[1])
 
-    top1_conf = float(probabilities[top1_idx])
-    top2_conf = float(probabilities[top2_idx])
+    # -------------------------------------------------------------------
+    # TWO-POINTER RESOLUTION FILTER FOR OVERLAPPING DISEASES (#270 Feature)
+    # -------------------------------------------------------------------
+    indexed_probs = sorted(
+        [(float(prob), idx) for idx, prob in enumerate(probabilities)],
+        key=lambda x: x[0],
+        reverse=True
+    )
+
+    low = 0
+    high = 1
+
+    top1_conf, top1_idx = indexed_probs[low]
+    top2_conf, top2_idx = indexed_probs[high]
 
     predicted_class = disease_classes[top1_idx]
     alternative_class = disease_classes[top2_idx]
@@ -429,13 +466,25 @@ def infer_disease(image: np.ndarray) -> Dict[str, Any]:
     health_score = float(probabilities[healthy_idx]) * 100
 
     is_uncertain = top1_conf < UNCERTAINTY_THRESHOLD
-    is_ambiguous = abs(top1_conf - top2_conf) < AMBIGUITY_MARGIN
+    is_ambiguous = False
+    contender_classes = []
+
+    while high < len(indexed_probs):
+        current_conf, current_idx = indexed_probs[high]
+        if abs(top1_conf - current_conf) < AMBIGUITY_MARGIN:
+            is_ambiguous = True
+            contender_classes.append(disease_classes[current_idx])
+        high += 1
 
     interpretation_message = None
     if is_uncertain:
         interpretation_message = "The model could not make a confident prediction. Please upload a clearer crop image or seek expert review."
     elif is_ambiguous:
-        interpretation_message = f"The prediction is somewhat ambiguous between {predicted_class} and {alternative_class}."
+        if len(contender_classes) > 1:
+            contenders_str = ", ".join(contender_classes)
+            interpretation_message = f"The prediction is close between {predicted_class} and other localized indicators: {contenders_str}. Monitor the crop closely for overlapping symptoms."
+        else:
+            interpretation_message = f"The prediction is somewhat ambiguous between {predicted_class} and {alternative_class}."
 
     disease_confidences = {disease_classes[i]: float(probabilities[i]) for i in range(len(disease_classes))}
 
@@ -456,6 +505,7 @@ def infer_disease(image: np.ndarray) -> Dict[str, Any]:
         "is_ambiguous": is_ambiguous,
         "interpretation_message": interpretation_message,
     }
+
 
 def infer_growth_stage(image: np.ndarray) -> Dict[str, Any]:
     _, yolo_model = model_manager.load_models()
@@ -498,6 +548,7 @@ def infer_growth_stage(image: np.ndarray) -> Dict[str, Any]:
         })
     result["raw"] = boxes
     return result
+
 
 def generate_recommendations(disease_result: Dict[str, Any], growth_result: Dict[str, Any], weather: Optional[Dict[str, Any]] = None) -> list[str]:
     recs: list[str] = []
@@ -543,6 +594,7 @@ def generate_recommendations(disease_result: Dict[str, Any], growth_result: Dict
 
     return recs[:6]
 
+
 def generate_farmer_insights(disease_result: Dict[str, Any], growth_result: Dict[str, Any]) -> list[str]:
     insights = []
     dclass = disease_result["predicted_class"]
@@ -569,6 +621,7 @@ def generate_farmer_insights(disease_result: Dict[str, Any], growth_result: Dict
 
     return insights
 
+
 def generate_advanced_recommendations(disease_result: Dict[str, Any], growth_result: Dict[str, Any]) -> Dict[str, str]:
     gmain = growth_result.get("main_class", "Unknown")
     dclass = disease_result["predicted_class"]
@@ -593,8 +646,10 @@ def generate_advanced_recommendations(disease_result: Dict[str, Any], growth_res
         adv_recs["pest_prevention"] = "Apply specific anti-worm biological controls like Bacillus thuringiensis (Bt)."
     elif dclass == "Cotton Boll Rot":
         adv_recs["irrigation_timing"] = "Stop irrigation immediately to allow soil and plant base to dry."
-
+        
     return adv_recs
+
+
 
 def encode_image_for_display(image: np.ndarray) -> str:
     display_image = resize_image(image, DISPLAY_IMAGE_MAX_DIMENSION)
@@ -604,20 +659,20 @@ def encode_image_for_display(image: np.ndarray) -> str:
         raise ValueError("Failed to encode image for display")
     return base64.b64encode(buffer).decode("utf-8")
 
+
 def is_allowed_image(filename: str) -> bool:
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_IMAGE_EXTENSIONS
+
 
 def calculate_file_hash(file_storage) -> str:
     """Generate SHA-256 hash for an uploaded file using chunk reading."""
     sha256_hash = hashlib.sha256()
-    # Ensure we start from the beginning of the file
     file_storage.seek(0)
-    # Read in 4KB chunks
     for byte_block in iter(lambda: file_storage.read(4096), b""):
         sha256_hash.update(byte_block)
-    # Reset file pointer for subsequent reads
     file_storage.seek(0)
     return sha256_hash.hexdigest()
+
 
 def read_uploaded_image(file_storage) -> Tuple[str, np.ndarray, np.ndarray]:
     safe_filename = secure_filename(file_storage.filename)
@@ -626,6 +681,27 @@ def read_uploaded_image(file_storage) -> Tuple[str, np.ndarray, np.ndarray]:
     if image is None:
         raise ValueError("Error reading image file")
     return safe_filename, image, cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+
+# -------------------------------------------------------------------
+# THREAD-SAFE GRAD-CAM CACHE
+# -------------------------------------------------------------------
+GRAD_CAM_CACHE = {}
+GRAD_CAM_CACHE_LOCK = threading.Lock()
+MAX_CACHE_SIZE = 100
+
+def get_cached_grad_cam(image_hash: str) -> Optional[Tuple[str, str]]:
+    with GRAD_CAM_CACHE_LOCK:
+        return GRAD_CAM_CACHE.get(image_hash)
+
+def set_cached_grad_cam(image_hash: str, overlay_b64: str, heatmap_only_b64: str) -> None:
+    with GRAD_CAM_CACHE_LOCK:
+        if len(GRAD_CAM_CACHE) >= MAX_CACHE_SIZE:
+            # FIFO eviction
+            first_key = next(iter(GRAD_CAM_CACHE))
+            GRAD_CAM_CACHE.pop(first_key, None)
+        GRAD_CAM_CACHE[image_hash] = (overlay_b64, heatmap_only_b64)
+
 
 def analyze_image(image: np.ndarray) -> Dict[str, Any]:
     resnet_model, yolo_model = model_manager.load_models()
@@ -640,29 +716,51 @@ def analyze_image(image: np.ndarray) -> Dict[str, Any]:
         if not isinstance(disease, dict) or "predicted_class" not in disease or "health_score" not in disease:
             raise ValueError("Invalid disease model prediction output.")
 
+        # Check cache first
+        image_hash = hashlib.sha256(image.tobytes()).hexdigest()
+        cached_result = get_cached_grad_cam(image_hash)
+        
         grad_cam_image_b64 = None
-        if resnet_model is not None and disease.get("predicted_class_idx") is not None:
-            try:
-                input_tensor = preprocess_image_for_resnet(image)
-                with GradCAM(resnet_model, resnet_model.layer4[-1]) as grad_cam:
-                    grad_cam_overlay = grad_cam(input_tensor, disease["predicted_class_idx"], image)
-                if grad_cam_overlay is not None:
-                    grad_cam_image_b64 = encode_image_for_display(grad_cam_overlay)
-            except Exception as exc:
-                logger.error("Error generating Grad-CAM: %s", exc)
+        heatmap_only_b64 = None
+        
+        if cached_result is not None:
+            grad_cam_image_b64, heatmap_only_b64 = cached_result
+            logger.info("Using cached Grad-CAM heatmaps")
+        else:
+            if resnet_model is not None and disease.get("predicted_class_idx") is not None:
+                try:
+                    input_tensor = preprocess_image_for_resnet(image)
+                    with GradCAM(resnet_model, resnet_model.layer4[-1]) as grad_cam:
+                        grad_cam_overlay = grad_cam(input_tensor, disease["predicted_class_idx"], image)
+                        heatmap_np = getattr(grad_cam, "heatmap_np", None)
+                    if grad_cam_overlay is not None:
+                        grad_cam_image_b64 = encode_image_for_display(grad_cam_overlay)
+                    if heatmap_np is not None:
+                        pure_heatmap_rgb = generate_pure_heatmap(image, heatmap_np)
+                        heatmap_only_b64 = encode_image_for_display(pure_heatmap_rgb)
+                except Exception as exc:
+                    logger.error("Error generating Grad-CAM: %s", exc)
 
-        if grad_cam_image_b64 is None:
-            try:
-                mock_overlay = apply_heatmap_on_image(image, generate_mock_heatmap(image))
-                grad_cam_image_b64 = encode_image_for_display(mock_overlay)
-            except Exception as exc:
-                logger.error("Error generating fallback heatmap: %s", exc)
+            if grad_cam_image_b64 is None or heatmap_only_b64 is None:
+                try:
+                    mock_heatmap = generate_mock_heatmap(image)
+                    mock_overlay = apply_heatmap_on_image(image, mock_heatmap)
+                    grad_cam_image_b64 = encode_image_for_display(mock_overlay)
+                    
+                    pure_heatmap_rgb = generate_pure_heatmap(image, mock_heatmap)
+                    heatmap_only_b64 = encode_image_for_display(pure_heatmap_rgb)
+                except Exception as exc:
+                    logger.error("Error generating fallback heatmap: %s", exc)
+            
+            if grad_cam_image_b64 and heatmap_only_b64:
+                set_cached_grad_cam(image_hash, grad_cam_image_b64, heatmap_only_b64)
 
         disease["heatmap_b64"] = grad_cam_image_b64
+        disease["heatmap_only_b64"] = heatmap_only_b64
 
         recs = generate_recommendations(disease, growth)
         severity = calculate_disease_severity(disease["health_score"])
-        y_pred = predict_yield(disease["health_score"], growth.get("main_class", "Unknown"))
+        yield_est = estimate_yield(disease, growth, weather=None, field_acres=1.0)
         adv_recs = generate_advanced_recommendations(disease, growth)
         insights = generate_farmer_insights(disease, growth)
 
@@ -671,8 +769,9 @@ def analyze_image(image: np.ndarray) -> Dict[str, Any]:
             "growth": growth,
             "recommendations": recs,
             "grad_cam_image_b64": grad_cam_image_b64,
+            "heatmap_only_b64": heatmap_only_b64,
             "disease_severity": severity,
-            "yield_prediction": y_pred,
+            "yield_estimate": yield_est,
             "advanced_recommendations": adv_recs,
             "farmer_insights": insights,
         }
@@ -689,6 +788,7 @@ def analyze_image(image: np.ndarray) -> Dict[str, Any]:
     except Exception as exc:
         logger.error("Unexpected error in image analysis: %s", exc)
         return {"error": "The AI model encountered an unexpected error while analyzing the image. Please verify the image file format and content and try again."}
+
 
 def build_comparison_result(old_results: Dict[str, Any], new_results: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(old_results, dict) or not isinstance(new_results, dict):
@@ -756,17 +856,21 @@ def add_no_cache_headers(response):
     response.headers["Expires"] = "0"
     return response
 
+
 def is_pytest_mode() -> bool:
     return "PYTEST_CURRENT_TEST" in os.environ
+
 
 @app.route("/")
 def index():
     lang = request.args.get("lang", "en")
     return render_template("index.html", text=LANG.get(lang, LANG["en"]), lang=lang)
 
+
 @app.route("/set-language/<lang>")
 def set_language(lang):
     return redirect(url_for("index", lang=lang))
+
 
 @app.template_filter("datetimeformat")
 def datetimeformat_filter(value):
@@ -774,17 +878,21 @@ def datetimeformat_filter(value):
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     return value
 
+
 @app.route("/tutorials")
 def tutorials():
     return render_template("tutorials.html")
+
 
 @app.route("/support")
 def support():
     return render_template("support.html")
 
+
 @app.route("/stories")
 def stories():
     return render_template("stories.html")
+
 
 @app.route("/dashboard")
 def dashboard():
@@ -796,9 +904,11 @@ def dashboard():
     ]
     return render_template("dashboard.html", farms=farms)
 
+
 @app.route("/history")
 def history():
     return render_template("history.html")
+
 
 @app.route("/health")
 def health():
@@ -813,6 +923,7 @@ def health():
         "models": diagnostics,
         "service": "Agri-Vision Cotton Analysis API",
     })
+
 
 @app.route("/analyze", methods=["GET", "POST"])
 def analyze():
@@ -869,6 +980,7 @@ def analyze():
                 timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 weather=weather,
                 grad_cam_image_b64=results.get("grad_cam_image_b64"),
+                heatmap_only_b64=results.get("heatmap_only_b64"),
                 disease_info=disease_info,
             )
         except Exception as exc:
@@ -877,6 +989,7 @@ def analyze():
             return redirect(request.url)
 
     return render_template("upload.html")
+
 
 @app.route("/comparison", methods=["GET", "POST"])
 def comparison():
@@ -897,7 +1010,6 @@ def comparison():
                 flash(f"Invalid file type for {label}. Please upload PNG, JPG, JPEG, or GIF.", "error")
                 return redirect(request.url)
 
-        # REAL SHA-256 Duplicate Validation
         try:
             last_week_file = request.files["last_week_image"]
             current_week_file = request.files["current_week_image"]
@@ -910,7 +1022,6 @@ def comparison():
                 return render_template("comparison.html", error_message=error_message)
         except Exception as exc:
             logger.error("Hashing error: %s", exc)
-            # Continue if hashing fails, but log it
 
         try:
             old_filename, old_image, old_rgb = read_uploaded_image(request.files["last_week_image"])
@@ -960,6 +1071,7 @@ def comparison():
             )
     return render_template("comparison.html")
 
+
 @app.route("/demo")
 def demo():
     try:
@@ -981,65 +1093,106 @@ def demo():
             {"class_id": 3, "class_name": "Matured Cotton Boll", "confidence": 0.91, "bbox": [120, 80, 210, 155]},
             {"class_id": 4, "class_name": "Split Cotton Boll", "confidence": 0.70, "bbox": [300, 120, 390, 210]},
         ]
-        demo_growth = {
-            "main_class": "Matured Cotton Boll",
-            "main_class_idx": 3,
-            "confidence": 0.91,
-            "boxes": demo_growth_boxes,
-            "raw": demo_growth_boxes,
-        }
 
+        demo_growth = {
+        "main_class": "Matured Cotton Boll",
+        "main_class_idx": 3,
+        "confidence": 0.91,
+        "boxes": demo_growth_boxes,
+        "raw": demo_growth_boxes,
+        }
+    
+        # Generate high-quality synthetic cotton BGR image representing field crop
         synthetic_bgr = np.zeros((384, 512, 3), dtype=np.uint8)
+    
+        # Fill background with a rich soft earthy background
         synthetic_bgr[:, :] = [30, 40, 45]
-        cv2.circle(synthetic_bgr, (200, 220), 120, (34, 139, 34), -1)
-        cv2.circle(synthetic_bgr, (320, 260), 100, (46, 139, 87), -1)
-        cv2.circle(synthetic_bgr, (120, 280), 90, (34, 120, 34), -1)
+    
+        # Draw deep-green leaf foliage (multiple overlapping green circles)
+        cv2.circle(synthetic_bgr, (200, 220), 120, (34, 139, 34), -1) # Forest Green
+        cv2.circle(synthetic_bgr, (320, 260), 100, (46, 139, 87), -1) # Sea Green
+        cv2.circle(synthetic_bgr, (120, 280), 90, (34, 120, 34), -1) # Darker Green
+    
+        # Draw organic branch structure
         cv2.line(synthetic_bgr, (256, 384), (256, 200), (42, 75, 124), 12)
         cv2.line(synthetic_bgr, (256, 260), (140, 180), (42, 75, 124), 8)
         cv2.line(synthetic_bgr, (256, 220), (380, 150), (42, 75, 124), 8)
+    
+        # Draw localized crop anomalies (reddish-brown leaf spots / target spot disease representation)
         cv2.circle(synthetic_bgr, (220, 200), 15, (40, 50, 139), -1)
         cv2.circle(synthetic_bgr, (215, 195), 5, (20, 30, 80), -1)
         cv2.circle(synthetic_bgr, (180, 240), 10, (40, 50, 139), -1)
+    
+        # Draw Matured Cotton Boll within [120, 80, 210, 155] (center is (165, 117.5))
         cv2.ellipse(synthetic_bgr, (165, 117), (40, 30), 0, 0, 360, (50, 180, 100), -1)
         cv2.ellipse(synthetic_bgr, (165, 117), (40, 30), 0, 0, 360, (40, 140, 80), 2)
         cv2.line(synthetic_bgr, (165, 87), (165, 75), (42, 75, 124), 4)
+
+        # Draw Split Cotton Boll within [300, 120, 390, 210] (center is (345, 165))
         cv2.circle(synthetic_bgr, (330, 165), 20, (245, 245, 245), -1)
         cv2.circle(synthetic_bgr, (360, 165), 20, (245, 245, 245), -1)
         cv2.circle(synthetic_bgr, (345, 150), 20, (255, 255, 255), -1)
         cv2.circle(synthetic_bgr, (345, 180), 20, (230, 230, 230), -1)
         cv2.ellipse(synthetic_bgr, (345, 185), (35, 15), 0, 0, 360, (30, 50, 90), -1)
-
+    
+        # Convert from BGR to RGB
         synthetic_rgb = cv2.cvtColor(synthetic_bgr, cv2.COLOR_BGR2RGB)
-        mock_overlay = apply_heatmap_on_image(synthetic_rgb, generate_mock_heatmap(synthetic_rgb))
+    
+        # Generate mock heatmap
+        mock_heatmap = generate_mock_heatmap(synthetic_rgb)
+        mock_overlay = apply_heatmap_on_image(synthetic_rgb, mock_heatmap)
+    
+        # Base64 encode both original synthetic image and XAI overlay
         image_b64 = encode_image_for_display(synthetic_rgb)
         grad_cam_image_b64 = encode_image_for_display(mock_overlay)
-
+    
+        # Set top-level and nested properties for robustness
         demo_disease["heatmap_b64"] = grad_cam_image_b64
-        example_json = {
-            "disease": demo_disease,
-            "growth": demo_growth,
-            "recommendations": generate_recommendations(demo_disease, demo_growth),
-            "grad_cam_image_b64": grad_cam_image_b64,
-        }
+    
+        # Calculate Severity
+        severity = calculate_disease_severity(demo_disease["health_score"])
+    
+        # Use estimate_yield from service
+        from services.yield_service import estimate_yield
+        yield_est = estimate_yield(demo_disease, demo_growth, weather=None, field_acres=1.0)
+    
+        # Generate advanced recommendations
+        adv_recs = generate_advanced_recommendations(demo_disease, demo_growth)
+    
+        # Generate farmer insights
+        insights = generate_farmer_insights(demo_disease, demo_growth)
 
+        example_json = {
+        "disease": demo_disease,
+        "growth": demo_growth,
+        "recommendations": generate_recommendations(demo_disease, demo_growth),
+        "grad_cam_image_b64": grad_cam_image_b64,
+        "disease_severity": severity,
+        "yield_estimate": yield_est,
+        "advanced_recommendations": adv_recs,
+        "farmer_insights": insights
+        }
         return render_template(
-            "results.html",
-            results=example_json,
-            filename="demo_cotton.jpg",
-            image_b64=image_b64,
-            img_shape={"width": 512, "height": 384},
-            raw_json=json.dumps(example_json, indent=2),
-            timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            grad_cam_image_b64=grad_cam_image_b64,
-            disease_info=disease_info_map.get("Healthy", {}),
+        "results.html",
+        results=example_json,
+        filename="demo_cotton.jpg",
+        image_b64=image_b64,
+        img_shape={"width": 512, "height": 384},
+        raw_json=json.dumps(example_json, indent=2),
+        timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        grad_cam_image_b64=grad_cam_image_b64,
+        yield_estimate=yield_est # Also pass as top-level for robustness
         )
+
     except Exception as e:
         logger.error(f"Demo route failed: {e}")
         return redirect(url_for("index"))
 
+
 @app.route("/api/chat_test", methods=["GET"])
 def api_chat_test():
     return jsonify({"status": "ok"})
+
 
 @app.route("/api/chat", methods=["POST"])
 @app.route("/api/chat/", methods=["POST"])
@@ -1050,20 +1203,58 @@ def api_chat():
 
     message = str(data["message"]).lower()
     responses = {
-        r"\b(hello|hi|hey)\b": ["Hello there! How can I assist you with your cotton crop today?", "Hi! Need any help analyzing your farm data?"],
-        r"\b(disease|sick|spots|rot|blight)\b": ["If you're noticing leaf spots or rotting, it could be Bacterial Blight or Target Spot. I highly recommend taking a picture and uploading it to our Analyze tab for an AI diagnosis."],
-        r"\b(yield|harvest|produce)\b": ["Yield depends heavily on the crop's health score and current growth stage. Check out the Dashboard for predictions across your fields!"],
-        r"\b(fertilizer|nutrient|npk|potassium)\b": ["Cotton responds well to a balanced NPK fertilizer. During the blooming and early boll stages, potassium is critical to maximize yield."],
-        r"\b(water|irrigation|dry)\b": ["Maintain regular watering during the blossom phase. However, once bolls mature and start splitting, you should reduce irrigation to prevent rot."],
-        r"\b(pest|worm|aphid|bug)\b": ["Pests like Pink Bollworm and Aphids are common enemies of cotton. I recommend deploying pheromone traps and scouting the fields twice a week."],
+        r"\b(hello|hi|hey|howdy|greetings)\b": [
+            "Hello there! How can I assist you with your cotton crop today?",
+            "Hi! Need any help analyzing your farm data?"
+        ],
+        r"\b(disease|diseases|sick|spots?|rot|blight)\b": [
+            "If you're noticing leaf spots or rotting, it could be Bacterial Blight or Target Spot. I highly recommend taking a picture and uploading it to our Analyze tab for an AI diagnosis."
+        ],
+        r"\b(yield|yields|harvest|harvests|produce)\b": [
+            "Yield depends heavily on the crop's health score and current growth stage. Check out the Dashboard for predictions across your fields!"
+        ],
+        r"\b(fertilizer|fertilizers|nutrient|nutrients|npk|potassium)\b": [
+            "Cotton responds well to a balanced NPK fertilizer. During the blooming and early boll stages, potassium is critical to maximize yield."
+        ],
+        r"\b(water|watering|irrigation|dry|drought)\b": [
+            "Maintain regular watering during the blossom phase. However, once bolls mature and start splitting, you should reduce irrigation to prevent rot."
+        ],
+        r"\b(pest|pests|worm|worms|aphid|aphids|bug|bugs|insect|insects|bollworm)\b": [
+            "Pests like Pink Bollworm and Aphids are common enemies of cotton. I recommend deploying pheromone traps and scouting the fields twice a week."
+        ],
+        r"\b(weather|temperature|rain|rainfall|humidity|climate)\b": [
+            "Weather plays a huge role in cotton health. Hot, dry spells stress bolls while excess rain can encourage fungal diseases. Use our weather tab to monitor conditions."
+        ],
+        r"\b(soil|soils|ph|minerals|clay|loam|sandy)\b": [
+            "Cotton thrives in well-draining loamy soil with a pH of 5.8–8.0. Conduct a soil test before the season to identify any nutrient deficiencies."
+        ],
+        r"\b(grow|growth|growing|stage|stages|seedling|boll|bolls|flower|flowering)\b": [
+            "Cotton growth has 5 key stages: germination, seedling, vegetative, flowering/boll formation, and maturity. Each stage has unique care needs — the flowering stage is most critical!"
+        ],
+        r"\b(spray|spraying|pesticide|pesticides|fungicide|herbicide|chemical)\b": [
+            "When spraying, always follow label rates and avoid spraying during peak heat or wind. Consider integrated pest management (IPM) to reduce chemical dependency."
+        ],
+        r"\b(thank(?:s|s you)?|awesome|great|perfect)\b": [
+            "You're welcome! Feel free to ask any time. Happy farming! 🌱",
+            "Glad I could help! Let me know if you have more questions about your cotton crop."
+        ],
+        r"\b(help|assist|support|guide|advice|tips?)\b": [
+            "I'm here to help! You can ask me about crop diseases, yield optimization, pest control, irrigation, fertilization, weather impacts, or soil health.",
+            "Sure! Try asking about cotton diseases, pest control, yield estimates, or upload an image in the Analyze tab for an instant AI diagnosis."
+        ],
+        r"\b(cotton|crop|crops|farm|farming|field|fields)\b": [
+            "Agri-Vision specializes in cotton crop analysis. Upload a field image in the Analyze tab for disease detection, yield prediction, and health scoring!"
+        ],
     }
 
     reply = "I'm your Agri-Vision AI assistant. I specialize in cotton farming, crop diseases, and yield optimization. How can I help you?"
+
     for pattern, reply_options in responses.items():
         if re.search(pattern, message):
             reply = random.choice(reply_options)
             break
     return jsonify({"reply": reply})
+
 
 @app.route("/api/weather")
 def api_weather():
@@ -1087,6 +1278,7 @@ def api_weather():
 
     weather["weather_recommendations"] = generate_weather_recommendations(weather)
     return jsonify({"status": "success", "weather": weather})
+
 
 @app.route("/api/analyze", methods=["POST"])
 def api_analyze():
@@ -1124,6 +1316,46 @@ def api_analyze():
         logger.error("API analysis trigger error: %s", exc)
         return jsonify({"error": str(exc)}), 500
 
+
+@app.route("/api/explain", methods=["POST"])
+def api_explain():
+    if "file" not in request.files:
+        return jsonify({"error": "No file uploaded"}), 400
+    file = request.files["file"]
+    if file.filename == "":
+        return jsonify({"error": "No file selected"}), 400
+    if not is_allowed_image(file.filename):
+        return jsonify({'error': 'Invalid file type. Please upload a valid image.'}), 400
+
+    try:
+        safe_filename, image, image_rgb = read_uploaded_image(file)
+        compressed_rgb = resize_image(image_rgb, MAX_INFERENCE_DIMENSION)
+        results = analyze_image(compressed_rgb)
+        
+        if results.get("error"):
+            return jsonify({"error": results["error"]}), 400
+            
+        disease = results.get("disease", {})
+        
+        return jsonify({
+            "status": "success",
+            "timestamp": datetime.now().isoformat(),
+            "filename": safe_filename,
+            "predicted_class": disease.get("predicted_class"),
+            "confidence": disease.get("confidence"),
+            "health_score": disease.get("health_score"),
+            "image_b64": encode_image_for_display(image_rgb),
+            "heatmap_b64": results.get("grad_cam_image_b64"),
+            "heatmap_only_b64": results.get("heatmap_only_b64"),
+            "target_layer": "ResNet50 layer4[-1]",
+            "all_confidences": disease.get("all_confidences", {})
+        }), 200
+
+    except Exception as exc:
+        logger.error("API explain error: %s", exc)
+        return jsonify({"error": str(exc)}), 500
+
+
 @app.route("/api/task/<task_id>", methods=["GET"])
 def get_task_status(task_id):
     if is_pytest_mode():
@@ -1148,6 +1380,7 @@ def get_task_status(task_id):
     else:
         response = {"state": task.state, "status": str(task.info)}
     return jsonify(response)
+
 
 @app.route("/api/analyze_stream", methods=["POST"])
 def api_analyze_stream():
@@ -1198,10 +1431,55 @@ def api_analyze_stream():
             return
 
         try:
+            # Generate Grad-CAM heatmaps for stream
+            grad_cam_image_b64 = None
+            heatmap_only_b64 = None
+            
+            image_hash = hashlib.sha256(compressed_rgb.tobytes()).hexdigest()
+            cached_result = get_cached_grad_cam(image_hash)
+            
+            if cached_result is not None:
+                grad_cam_image_b64, heatmap_only_b64 = cached_result
+                logger.info("Using cached Grad-CAM for stream")
+            else:
+                resnet_model, _ = model_manager.load_models()
+                if resnet_model is not None and disease.get("predicted_class_idx") is not None:
+                    try:
+                        input_tensor = preprocess_image_for_resnet(compressed_rgb)
+                        with GradCAM(resnet_model, resnet_model.layer4[-1]) as grad_cam:
+                            grad_cam_overlay = grad_cam(input_tensor, disease["predicted_class_idx"], compressed_rgb)
+                            heatmap_np = getattr(grad_cam, "heatmap_np", None)
+                        if grad_cam_overlay is not None:
+                            grad_cam_image_b64 = encode_image_for_display(grad_cam_overlay)
+                        if heatmap_np is not None:
+                            pure_heatmap_rgb = generate_pure_heatmap(compressed_rgb, heatmap_np)
+                            heatmap_only_b64 = encode_image_for_display(pure_heatmap_rgb)
+                    except Exception as exc:
+                        logger.error("Error generating Grad-CAM for stream: %s", exc)
+
+                if grad_cam_image_b64 is None or heatmap_only_b64 is None:
+                    try:
+                        mock_heatmap = generate_mock_heatmap(compressed_rgb)
+                        mock_overlay = apply_heatmap_on_image(compressed_rgb, mock_heatmap)
+                        grad_cam_image_b64 = encode_image_for_display(mock_overlay)
+                        
+                        pure_heatmap_rgb = generate_pure_heatmap(compressed_rgb, mock_heatmap)
+                        heatmap_only_b64 = encode_image_for_display(pure_heatmap_rgb)
+                    except Exception as exc:
+                        logger.error("Error generating fallback heatmap for stream: %s", exc)
+                
+                if grad_cam_image_b64 and heatmap_only_b64:
+                    set_cached_grad_cam(image_hash, grad_cam_image_b64, heatmap_only_b64)
+
+            disease["heatmap_b64"] = grad_cam_image_b64
+            disease["heatmap_only_b64"] = heatmap_only_b64
+
             results = {
                 "disease": disease,
                 "growth": growth,
                 "recommendations": generate_recommendations(disease, growth),
+                "grad_cam_image_b64": grad_cam_image_b64,
+                "heatmap_only_b64": heatmap_only_b64,
                 "error": None,
             }
             if growth.get("main_class") is None:
@@ -1232,7 +1510,7 @@ def api_analyze_stream():
 
             field_acres = request.form.get("field_acres", type=float) or 1.0
             if results.get("disease") and results.get("growth"):
-                yield_estimate = predict_yield(results["disease"]["health_score"], results["growth"].get("main_class", "Unknown"), field_acres)
+                yield_estimate = estimate_yield(results["disease"], results["growth"], weather, field_acres)
         except Exception as exc:
             logger.warning("Weather/yield enrichment failed: %s", exc)
 
@@ -1246,6 +1524,8 @@ def api_analyze_stream():
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "weather": weather,
                 "yield_estimate": yield_estimate,
+                "grad_cam_image_b64": grad_cam_image_b64,
+                "heatmap_only_b64": heatmap_only_b64,
             }
             yield event("complete", 100, "Analysis complete!", data=complete_payload)
         except Exception as exc:
@@ -1253,6 +1533,7 @@ def api_analyze_stream():
             return
 
     return Response(stream_with_context(generate()), mimetype="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
 
 @app.route("/analyze_result", methods=["POST"])
 def analyze_result():
@@ -1286,6 +1567,8 @@ def analyze_result():
             timestamp=timestamp,
             weather=weather,
             yield_estimate=yield_estimate,
+            grad_cam_image_b64=results.get("grad_cam_image_b64"),
+            heatmap_only_b64=results.get("heatmap_only_b64"),
         )
     except Exception as exc:
         logger.error("analyze_result error: %s", exc)
@@ -1309,7 +1592,6 @@ if __name__ == "__main__":
     logger.info("/health        - Health check")
     logger.info("=" * 60)
 
-    # Initialize models via the Thread-Safe ModelManager
     ensure_models_loaded()
     
     is_debug = os.getenv("FLASK_DEBUG", "False").lower() in ("true", "1", "t")
