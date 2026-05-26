@@ -219,6 +219,11 @@ function useMyLocation() {
                         margin: 1rem 0 0; font-size:0.82rem;
                         color:rgba(255,255,255,0.55); font-style:italic;
                     "></p>
+                    <div style="margin-top:0.75rem;">
+                        <button id="cancelAnalysisBtn" type="button" onclick="cancelAnalysis()" style="
+                            padding: 0.4rem 0.85rem; background: #dc3545; color: white; border: none; border-radius: 8px; cursor: pointer; font-size: 0.85rem;
+                        ">✕ Cancel Analysis</button>
+                    </div>
                 </div>
             </div>
             
@@ -348,6 +353,9 @@ function useMyLocation() {
 <script>
 const MAX_IMAGE_SIZE = 5 * 1024 * 1024; // 5MB for images
 const MAX_PDF_SIZE = 10 * 1024 * 1024;  // 10MB for PDFs
+// Small client-side delay between processing streamed steps (ms)
+// Helps give users time to click "Cancel Analysis" before the UI finishes.
+const PROCESSING_STEP_DELAY_MS = 700;
 
 function showError(message) {
     const errorDiv = document.getElementById('validation-error');
@@ -569,6 +577,9 @@ uploadArea.addEventListener('drop', (e) => {
 
 
 let isAnalyzing = false;
+let analysisAbortController = null;
+let analysisReader = null;
+let originalSubmitHTML = null;
 
 document.querySelector('form').addEventListener('submit', async function(event) {
     event.preventDefault();   // stop normal form submission
@@ -591,6 +602,8 @@ document.querySelector('form').addEventListener('submit', async function(event) 
 
     isAnalyzing = true;
     submitBtn.disabled = true;
+    // Preserve original label so we can restore after cancel/error
+    if (originalSubmitHTML === null) originalSubmitHTML = submitBtn.innerHTML;
     submitBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Analyzing...';
  
     // Show progress panel, hide submit button (or disable it during progress)
@@ -619,16 +632,20 @@ document.querySelector('form').addEventListener('submit', async function(event) 
     let finalPayload = null;
  
     try {
+        // Use AbortController so the request can be cancelled from elsewhere
+        analysisAbortController = new AbortController();
         const response = await fetch('/api/analyze_stream', {
             method: 'POST',
             body: formData,
+            signal: analysisAbortController.signal,
         });
  
         if (!response.ok) {
             throw new Error(`Server error: ${response.status}`);
         }
  
-        const reader  = response.body.getReader();
+        analysisReader = response.body.getReader();
+        const reader  = analysisReader;
         const decoder = new TextDecoder();
         let   buffer  = '';
  
@@ -650,7 +667,17 @@ document.querySelector('form').addEventListener('submit', async function(event) 
                 }
  
                 const { step, progress, message, data } = parsed;
- 
+
+                // Small delay so UI updates are perceptible and cancel can be used
+                if (typeof PROCESSING_STEP_DELAY_MS === 'number' && PROCESSING_STEP_DELAY_MS > 0) {
+                    await new Promise(r => setTimeout(r, PROCESSING_STEP_DELAY_MS));
+                    if (analysisAbortController && analysisAbortController.signal && analysisAbortController.signal.aborted) {
+                        // aborted while waiting - reset UI and stop processing
+                        resetAnalysisUI();
+                        return;
+                    }
+                }
+
                 // Update progress bar
                 progressBar.style.width = progress + '%';
                 statusMsg.textContent = message;
@@ -745,6 +772,13 @@ document.querySelector('form').addEventListener('submit', async function(event) 
         }
  
     } catch (err) {
+        // If aborted intentionally, treat as cancellation and reset UI silently
+        if (err && err.name === 'AbortError') {
+            // user cancelled - clear UI without an error message
+            resetAnalysisUI();
+            return;
+        }
+
         statusMsg.textContent = '❌ Connection error: ' + err.message;
         statusMsg.style.color = '#ff6b6b';
         progressBar.style.background = '#ff6b6b';
@@ -767,7 +801,75 @@ document.querySelector('form').addEventListener('submit', async function(event) 
             isAnalyzing = false;
             submitBtn.disabled = false;
         }
+        // cleanup reader/controller references
+        analysisReader = null;
+        analysisAbortController = null;
     }
 });
+
+// Cancel / Reset helpers
+function resetAnalysisUI() {
+    const panel = document.getElementById('streamProgressPanel');
+    const progressBar = document.getElementById('streamProgressBar');
+    const statusMsg = document.getElementById('streamStatusMsg');
+    const submitBtn = document.querySelector('.action-btn');
+
+    // Hide panel and reset visuals
+    if (panel) panel.style.display = 'none';
+    if (progressBar) progressBar.style.width = '0%';
+    if (statusMsg) {
+        statusMsg.textContent = '';
+        statusMsg.style.color = '';
+    }
+
+    // Reset steps
+    const steps = ['upload', 'analyze', 'predict', 'complete'];
+    steps.forEach(s => {
+        const el = document.getElementById('step-' + s);
+        if (el) {
+            el.className = 'stream-step';
+            el.textContent = '⬜ ' + el.dataset.label;
+        }
+    });
+
+    // Restore submit button
+    if (submitBtn) {
+        submitBtn.style.display = '';
+        submitBtn.disabled = false;
+        if (originalSubmitHTML) submitBtn.innerHTML = originalSubmitHTML;
+    }
+
+    // hide overlay if visible
+    const loadingOverlay = document.getElementById('loadingOverlay');
+    if (loadingOverlay) loadingOverlay.classList.add('hidden');
+
+    isAnalyzing = false;
+}
+
+function cancelAnalysis() {
+    if (!isAnalyzing) return;
+
+    // Abort fetch if possible
+    try {
+        if (analysisAbortController) analysisAbortController.abort();
+        if (analysisReader) analysisReader.cancel();
+    } catch (e) {
+        console.warn('Error cancelling analysis:', e);
+    }
+
+    // Ensure UI is reset
+    resetAnalysisUI();
+}
+
+// Ensure removing the uploaded image during active analysis cancels analysis too
+// Use a function-expression assignment to avoid hoisting / recursion issues.
+const originalResetUpload = resetUpload;
+resetUpload = function() {
+    if (isAnalyzing) {
+        cancelAnalysis();
+    }
+    // call original behavior to clear preview
+    originalResetUpload();
+};
 </script>
 {% endblock %}
